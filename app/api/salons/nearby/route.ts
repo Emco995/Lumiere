@@ -26,76 +26,44 @@ function calculateDistanceKm(
   return Number((R * c).toFixed(1));
 }
 
-async function extractRealSalonImage(websiteUrl?: string): Promise<string | null> {
-  if (!websiteUrl) return null;
-  const normalizedUrl = websiteUrl.startsWith("http")
-    ? websiteUrl
-    : `https://${websiteUrl}`;
-
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1800);
-    const res = await fetch(normalizedUrl, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-      },
-    });
-    clearTimeout(timer);
-    if (!res.ok) return null;
-
-    const html = await res.text();
-    const ogMatch =
-      html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) ||
-      html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i) ||
-      html.match(/<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i);
-
-    if (ogMatch && ogMatch[1]) {
-      const rawImg = ogMatch[1].trim();
-      if (rawImg.startsWith("http")) return rawImg;
-      if (rawImg.startsWith("//")) return `https:${rawImg}`;
-      if (rawImg.startsWith("/")) {
-        const origin = new URL(normalizedUrl).origin;
-        return `${origin}${rawImg}`;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function formatSalonObject(
+function buildSalonObject(
   id: string,
   name: string,
   city: string,
   address: string,
-  shopType: string,
+  tags: Record<string, any>,
   idx: number,
-  realImageUrl: string | null,
-  distanceKm?: number,
-  ratingOverride?: number,
-  reviewsOverride?: number
+  lat?: number,
+  lon?: number,
+  distanceKm?: number
 ) {
-  const lower = `${shopType} ${name}`.toLowerCase();
+  const shopType = String(tags.shop || "");
+  const beautyType = String(tags.beauty || "");
+  const lower = `${shopType} ${beautyType} ${name}`.toLowerCase();
 
-  const isHair =
-    lower.includes("hair") ||
-    lower.includes("friseur") ||
-    lower.includes("frizer") ||
-    lower.includes("coiffeur") ||
-    lower.includes("barber");
   const isNail =
     lower.includes("nail") ||
     lower.includes("nokt") ||
     lower.includes("manik") ||
-    lower.includes("pedik");
+    lower.includes("pedik") ||
+    lower.includes("nagel");
+
   const isMassage =
     lower.includes("massage") ||
     lower.includes("spa") ||
     lower.includes("masaž") ||
     lower.includes("wellness") ||
     lower.includes("thai");
+
+  const isHair =
+    !isNail &&
+    !isMassage &&
+    (lower.includes("hair") ||
+      lower.includes("friseur") ||
+      lower.includes("frizer") ||
+      lower.includes("coiffeur") ||
+      lower.includes("barber") ||
+      shopType === "hairdresser");
 
   const category = isHair
     ? "Kosa"
@@ -105,21 +73,32 @@ function formatSalonObject(
     ? "Masaža"
     : "Lice & Tijelo";
 
-  const cleanCity = city.charAt(0).toUpperCase() + city.slice(1);
+  let realImage = "";
+  if (typeof tags.image === "string" && tags.image.startsWith("http")) {
+    realImage = tags.image;
+  } else if (typeof tags.wikimedia_commons === "string") {
+    const fileName = tags.wikimedia_commons.replace(/^File:/i, "");
+    realImage = `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(
+      fileName
+    )}?width=800`;
+  }
 
   return {
     id,
     slug: `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${idx}`,
     name,
-    city: cleanCity,
-    address: address || `${cleanCity}, Centar`,
+    city,
+    address: address || `${city}, Centar`,
+    lat,
+    lon,
+    website: tags.website || tags["contact:website"],
     distanceKm,
-    rating: ratingOverride ?? Number((4.75 + (idx % 5) * 0.05).toFixed(2)),
-    reviewsCount: reviewsOverride ?? 42 + idx * 17,
-    coverImage: realImageUrl || "",
+    rating: Number((4.75 + (idx % 5) * 0.05).toFixed(2)),
+    reviewsCount: 38 + idx * 14,
+    coverImage: realImage,
     stylists: [
       {
-        id: `st-${id}-1`,
+        id: `st-${id}`,
         name: isHair
           ? "Senior Frizer & Stilista"
           : isNail
@@ -134,8 +113,8 @@ function formatSalonObject(
           : isMassage
           ? "Massage & Spa Therapy"
           : "Beauty & Aesthetic Care",
-        rating: 4.91,
-        reviewsCount: 58 + idx * 9,
+        rating: 4.92,
+        reviewsCount: 54 + idx * 7,
         avatar: STYLIST_AVATARS[idx % STYLIST_AVATARS.length],
         specialties: isHair
           ? ["Šišanje i feniranje", "Balayage / Koloracija", "Njega kose"]
@@ -211,16 +190,16 @@ export async function GET(request: NextRequest) {
   const latParam = searchParams.get("lat");
   const lonParam = searchParams.get("lon");
   const radiusKm = Math.min(
-    Math.max(Number(searchParams.get("radius") || 10), 1),
+    Math.max(Number(searchParams.get("radius") || 15), 1),
     100
   );
 
   try {
     let centerLat: number | null = latParam ? Number(latParam) : null;
     let centerLon: number | null = lonParam ? Number(lonParam) : null;
-    let resolvedCityName = cityQuery;
+    let resolvedCity = cityQuery;
 
-    // 1. Pouzdano geokodiranje grada putem Open-Meteo Geocoding API-ja (radi munjevito na Windowsu)
+    // 1. Geokodiraj grad putem Open-Meteo API-ja
     if (mode === "city" || centerLat === null || centerLon === null) {
       if (!cityQuery) {
         return NextResponse.json({ salons: [] });
@@ -229,7 +208,8 @@ export async function GET(request: NextRequest) {
       const geoRes = await fetch(
         `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
           cityQuery
-        )}&count=1&language=en&format=json`
+        )}&count=1&language=en&format=json`,
+        { cache: "no-store" }
       );
 
       if (!geoRes.ok) {
@@ -237,117 +217,40 @@ export async function GET(request: NextRequest) {
       }
 
       const geoData = await geoRes.json();
-      const firstResult = geoData?.results?.[0];
-
-      if (!firstResult) {
+      const first = geoData?.results?.[0];
+      if (!first) {
         return NextResponse.json({ salons: [] });
       }
 
-      centerLat = firstResult.latitude;
-      centerLon = firstResult.longitude;
-      resolvedCityName = firstResult.name || cityQuery;
+      centerLat = first.latitude;
+      centerLon = first.longitude;
+      resolvedCity = first.name || cityQuery;
     }
 
     const searchRadiusMeters =
-      mode === "city" ? 12000 : Math.round(radiusKm * 1000);
+      mode === "city" ? 9000 : Math.min(Math.round(radiusKm * 1000), 25000);
 
-    // 2. Ako postoji Google Places API ključ -> povuci stvarne Google Maps salone i prave slike
-    const googleApiKey = process.env.GOOGLE_PLACES_API_KEY;
-    if (googleApiKey && centerLat !== null && centerLon !== null) {
-      const textQuery =
-        mode === "city"
-          ? `hair salon beauty salon nail salon massage spa in ${resolvedCityName}`
-          : `hair salon beauty salon nail salon massage spa`;
-
-      const gRes = await fetch(
-        "https://places.googleapis.com/v1/places:searchText",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": googleApiKey,
-            "X-Goog-FieldMask":
-              "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.types,places.photos",
-          },
-          body: JSON.stringify({
-            textQuery,
-            locationBias: {
-              circle: {
-                center: { latitude: centerLat, longitude: centerLon },
-                radius: searchRadiusMeters,
-              },
-            },
-            maxResultCount: 20,
-          }),
-        }
-      );
-
-      if (gRes.ok) {
-        const gData = await gRes.json();
-        const places = gData.places || [];
-
-        const salons = places
-          .map((p: any, idx: number) => {
-            const pLat = p.location?.latitude ?? centerLat!;
-            const pLon = p.location?.longitude ?? centerLon!;
-            const dist =
-              mode === "nearby"
-                ? calculateDistanceKm(centerLat!, centerLon!, pLat, pLon)
-                : undefined;
-
-            const photoName = p.photos?.[0]?.name;
-            const realPhotoUrl = photoName
-              ? `/api/salons/photo?name=${encodeURIComponent(photoName)}`
-              : null;
-
-            return formatSalonObject(
-              `google-${p.id}`,
-              p.displayName?.text || "Beauty Salon",
-              resolvedCityName || "Grad",
-              p.formattedAddress || resolvedCityName,
-              (p.types || []).join(" "),
-              idx,
-              realPhotoUrl,
-              dist,
-              p.rating,
-              p.userRatingCount
-            );
-          })
-          .filter((s: any) =>
-            mode === "nearby" ? (s.distanceKm ?? 0) <= radiusKm : true
-          );
-
-        return NextResponse.json({ salons, source: "google_places" });
-      }
-    }
-
-    // 3. Paralelni upit prema Overpass serverima (ko prvi odgovori dobija prednost)
-    const overpassQuery = `[out:json][timeout:12];(node["shop"~"hairdresser|beauty|massage|cosmetics"](around:${searchRadiusMeters},${centerLat},${centerLon});way["shop"~"hairdresser|beauty|massage|cosmetics"](around:${searchRadiusMeters},${centerLat},${centerLon}););out center 30;`;
+    // 2. Overpass upit sa Vercel servera
+    const overpassQuery = `[out:json][timeout:10];(node["shop"~"hairdresser|beauty|massage|cosmetics|nail_salon"](around:${searchRadiusMeters},${centerLat},${centerLon});way["shop"~"hairdresser|beauty|massage|cosmetics|nail_salon"](around:${searchRadiusMeters},${centerLat},${centerLon}););out center 50;`;
 
     const mirrors = [
       "https://overpass-api.de/api/interpreter",
-      "https://lz4.overpass-api.de/api/interpreter",
-      "https://z.overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
     ];
 
     let elements: any[] = [];
 
     for (const mirror of mirrors) {
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 9000);
-
         const res = await fetch(mirror, {
           method: "POST",
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "LumiereBeautyPlatform/1.0",
+            "User-Agent": "LumiereBookingVercel/1.0",
           },
           body: `data=${encodeURIComponent(overpassQuery)}`,
-          signal: controller.signal,
+          cache: "no-store",
         });
-
-        clearTimeout(timeoutId);
 
         if (res.ok) {
           const text = await res.text();
@@ -358,97 +261,110 @@ export async function GET(request: NextRequest) {
           }
         }
       } catch {
-        // Nastavi na sljedeći mirror
+        // Probaj sljedeći mirror
       }
     }
 
-    const seenKeys = new Set<string>();
-    const rawItems: {
-      id: string;
-      name: string;
-      city: string;
-      address: string;
-      shopType: string;
-      website?: string;
-      image?: string;
-      dist?: number;
-    }[] = [];
+    const seen = new Set<string>();
+    const rawItems: { el: any; dist: number }[] = [];
 
     for (const el of elements) {
-      const tags = el.tags || {};
-      const name = tags.name;
+      const name = el.tags?.name;
       if (!name) continue;
 
       const elLat = el.lat ?? el.center?.lat ?? centerLat!;
       const elLon = el.lon ?? el.center?.lon ?? centerLon!;
-      const dist =
-        mode === "nearby"
-          ? calculateDistanceKm(centerLat!, centerLon!, elLat, elLon)
-          : undefined;
+      const dist = calculateDistanceKm(centerLat!, centerLon!, elLat, elLon);
 
-      if (mode === "nearby" && dist !== undefined && dist > radiusKm) continue;
+      if (mode === "nearby" && dist > radiusKm) continue;
 
-      const street = tags["addr:street"] || "";
-      const houseNum = tags["addr:housenumber"] || "";
-      const postcode = tags["addr:postcode"] || "";
-      const itemCity = tags["addr:city"] || resolvedCityName || cityQuery;
-      const address = [
-        `${street} ${houseNum}`.trim(),
-        postcode,
-        itemCity,
-      ]
-        .filter(Boolean)
-        .join(", ");
+      const key = `${name.toLowerCase()}-${el.tags?.["addr:street"] || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
 
-      const key = `${name.toLowerCase()}-${street.toLowerCase()}`;
-      if (!seenKeys.has(key)) {
-        seenKeys.add(key);
-        rawItems.push({
-          id: `osm-${el.id}`,
-          name,
-          city: itemCity,
-          address,
-          shopType: tags.shop || "beauty",
-          website: tags.website || tags["contact:website"],
-          image: tags.image,
-          dist,
-        });
-      }
+      rawItems.push({ el, dist });
     }
 
     if (mode === "nearby") {
-      rawItems.sort((a, b) => (a.dist ?? 0) - (b.dist ?? 0));
+      rawItems.sort((a, b) => a.dist - b.dist);
     }
 
-    const limitedItems = rawItems.slice(0, 24);
+    const salons = rawItems.slice(0, 36).map((item, idx) => {
+      const tags = item.el.tags || {};
+      const street = tags["addr:street"] || "";
+      const houseNum = tags["addr:housenumber"] || "";
+      const postcode = tags["addr:postcode"] || "";
+      const city = tags["addr:city"] || resolvedCity;
+      const address = [`${street} ${houseNum}`.trim(), postcode, city]
+        .filter(Boolean)
+        .join(", ");
 
-    // Pokušaj izvući stvarnu fotografiju sa zvaničnog sajta salona za prvih 12 rezultata radi brzine
-    const salons = await Promise.all(
-      limitedItems.map(async (item, idx) => {
-        const directImg =
-          typeof item.image === "string" && item.image.startsWith("http")
-            ? item.image
-            : null;
-        const websiteImg =
-          directImg ||
-          (idx < 12 ? await extractRealSalonImage(item.website) : null);
+      return buildSalonObject(
+        `osm-${item.el.id}-${idx}`,
+        tags.name,
+        city,
+        address,
+        tags,
+        idx,
+        item.el.lat ?? item.el.center?.lat,
+        item.el.lon ?? item.el.center?.lon,
+        mode === "nearby" ? item.dist : undefined
+      );
+    });
 
-        return formatSalonObject(
-          item.id,
-          item.name,
-          item.city,
-          item.address,
-          item.shopType,
-          idx,
-          websiteImg,
-          item.dist
-        );
-      })
-    );
+    // 3. Ako Overpass ne vrati ništa, dopuni putem Nominatim-a sa Vercel servera
+    if (salons.length === 0 && resolvedCity) {
+      const nomRes = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=25&q=${encodeURIComponent(
+          `hair beauty salon ${resolvedCity}`
+        )}`,
+        {
+          headers: { "User-Agent": "LumiereBookingVercel/1.0" },
+          cache: "no-store",
+        }
+      );
 
-    return NextResponse.json({ salons, mode, resolvedCityName });
+      if (nomRes.ok) {
+        const nomList = await nomRes.json();
+        for (const item of nomList) {
+          const name = item.name || item.display_name?.split(",")[0];
+          if (!name || seen.has(name.toLowerCase())) continue;
+
+          const itemLat = Number(item.lat);
+          const itemLon = Number(item.lon);
+          const dist = calculateDistanceKm(
+            centerLat!,
+            centerLon!,
+            itemLat,
+            itemLon
+          );
+          if (dist > 25) continue;
+
+          seen.add(name.toLowerCase());
+          const addr = item.address || {};
+          const street = `${addr.road || ""} ${addr.house_number || ""}`.trim();
+          const city = addr.city || addr.town || resolvedCity;
+
+          salons.push(
+            buildSalonObject(
+              `nom-${item.place_id}-${salons.length}`,
+              name,
+              city,
+              [street, addr.postcode, city].filter(Boolean).join(", "),
+              { shop: item.type || "beauty" },
+              salons.length,
+              itemLat,
+              itemLon,
+              mode === "nearby" ? dist : undefined
+            )
+          );
+        }
+      }
+    }
+
+    return NextResponse.json({ salons, resolvedCity });
   } catch (error) {
-    console.error("Greška pri pretrazi salona:", error);
+    console.error("Vercel API greška:", error);
     return NextResponse.json({ salons: [] });
   }
 }
