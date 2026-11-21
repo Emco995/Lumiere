@@ -1,69 +1,263 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useState } from "react";
+import Preloader from "@/components/Preloader";
+import Navbar from "@/components/Navbar";
+import PlatformHero from "@/components/PlatformHero";
+import SalonMarketplace from "@/components/SalonMarketplace";
+import { SALONS_DATA, Salon, ServiceCategory } from "@/lib/mock-data";
+import {
+  searchSalonsByCityClient,
+  searchSalonsByCoordsClient,
+} from "@/lib/salon-search";
+
+export default function HomePage() {
+  const [selectedCategory, setSelectedCategory] = useState<
+    ServiceCategory | "Sve"
+  >("Sve");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [cityInput, setCityInput] = useState("");
+  const [radiusKm, setRadiusKm] = useState<number>(15);
+
+  const [searchMode, setSearchMode] = useState<"default" | "city" | "nearby">(
+    "default"
+  );
+  const [activeLocationLabel, setActiveLocationLabel] = useState("");
+  const [activeRadiusKm, setActiveRadiusKm] = useState<number>(15);
+  const [userCoords, setUserCoords] = useState<{
+    lat: number;
+    lon: number;
+  } | null>(null);
+
+  const [salons, setSalons] = useState<Salon[]>(SALONS_DATA);
+  const [isLoadingSalons, setIsLoadingSalons] = useState(false);
+  const [quickRebookTrigger, setQuickRebookTrigger] = useState(0);
+
+  const scrollToResults = () => {
+    const el = document.getElementById("rezultati");
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  };
+
+  // 1. Pretraga po imenu grada (npr. Sarajevo, London, München, Bristol)
+  const handleSearchByCity = async (cityOverride?: string) => {
+    const targetCity = (cityOverride ?? cityInput).trim();
+
+    if (!targetCity) {
+      setSearchMode("default");
+      setSalons(SALONS_DATA);
+      setActiveLocationLabel("");
+      return;
+    }
+
+    setSearchMode("city");
+    setIsLoadingSalons(true);
+    setActiveLocationLabel(targetCity);
+    scrollToResults();
+
+    try {
+      const fetchedSalons = await searchSalonsByCityClient(targetCity);
+      const localFeatured = SALONS_DATA.filter(
+        (s) => s.city.toLowerCase() === targetCity.toLowerCase()
+      );
+
+      const seenIds = new Set(fetchedSalons.map((s) => s.id));
+      const merged = [
+        ...fetchedSalons,
+        ...localFeatured.filter((s) => !seenIds.has(s.id)),
+      ];
+
+      setSalons(merged);
+    } catch {
+      setSalons([]);
+    } finally {
+      setIsLoadingSalons(false);
+    }
+  };
+
+  // 2. Dohvaćanje salona oko koordinata korisnika
+  const fetchNearbyByCoords = async (
+    lat: number,
+    lon: number,
+    radius: number,
+    label: string
+  ) => {
+    setCityInput("");
+    setSearchMode("nearby");
+    setIsLoadingSalons(true);
+    setActiveLocationLabel(label);
+    setActiveRadiusKm(radius);
+    scrollToResults();
+
+    try {
+      const nearbySalons = await searchSalonsByCoordsClient(
+        lat,
+        lon,
+        radius,
+        label
+      );
+      setSalons(nearbySalons);
+    } catch {
+      setSalons([]);
+    } finally {
+      setIsLoadingSalons(false);
+    }
+  };
+
+  // 3. Automatska IP geolokacija ako GPS na uređaju nije dostupan ili je blokiran
+  const detectLocationByIp = async (targetRadius: number) => {
+    const providers = [
+      async () => {
+        const res = await fetch("https://freeipapi.com/api/json");
+        const data = await res.json();
+        if (data?.latitude && data?.longitude) {
+          return {
+            lat: Number(data.latitude),
+            lon: Number(data.longitude),
+            label: data.cityName || data.regionName || "Moja lokacija",
+          };
+        }
+        return null;
+      },
+      async () => {
+        const res = await fetch("https://get.geojs.io/v1/ip/geo.json");
+        const data = await res.json();
+        if (data?.latitude && data?.longitude) {
+          return {
+            lat: Number(data.latitude),
+            lon: Number(data.longitude),
+            label: data.city || data.region || "Moja lokacija",
+          };
+        }
+        return null;
+      },
+      async () => {
+        const res = await fetch("https://ipwho.is/");
+        const data = await res.json();
+        if (data?.success && data.latitude && data.longitude) {
+          return {
+            lat: Number(data.latitude),
+            lon: Number(data.longitude),
+            label: data.city || data.region || "Moja lokacija",
+          };
+        }
+        return null;
+      },
+    ];
+
+    for (const getLoc of providers) {
+      try {
+        const loc = await getLoc();
+        if (loc) {
+          setUserCoords({ lat: loc.lat, lon: loc.lon });
+          await fetchNearbyByCoords(loc.lat, loc.lon, targetRadius, loc.label);
+          return;
+        }
+      } catch {
+        // Probaj sljedeći servis
+      }
+    }
+
+    setIsLoadingSalons(false);
+    setSearchMode("default");
+    alert(
+      "Nije moguće automatski očitati lokaciju. Upišite svoj grad u polje lijevo."
+    );
+  };
+
+  // 4. Klik na dugme "Moja lokacija" ili promjena radijusa (km)
+  const handleSearchNearby = async (radiusOverride?: number) => {
+    const targetRadius = radiusOverride ?? radiusKm;
+
+    setCityInput("");
+    setSearchMode("nearby");
+    setIsLoadingSalons(true);
+    scrollToResults();
+
+    // Ako već imamo koordinate korisnika i samo mijenja radijus (km)
+    if (
+      typeof radiusOverride === "number" &&
+      userCoords &&
+      activeLocationLabel
+    ) {
+      await fetchNearbyByCoords(
+        userCoords.lat,
+        userCoords.lon,
+        targetRadius,
+        activeLocationLabel
+      );
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      await detectLocationByIp(targetRadius);
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        setUserCoords({ lat: latitude, lon: longitude });
+
+        try {
+          const revRes = await fetch(
+            `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${latitude}&longitude=${longitude}&localityLanguage=en`
+          );
+          const revData = await revRes.json();
+          const cityPart =
+            revData.city ||
+            revData.locality ||
+            revData.principalSubdivision ||
+            "Moja lokacija";
+
+          await fetchNearbyByCoords(latitude, longitude, targetRadius, cityPart);
+        } catch {
+          await fetchNearbyByCoords(
+            latitude,
+            longitude,
+            targetRadius,
+            "Moja trenutna lokacija"
+          );
+        }
+      },
+      async () => {
+        // Ako browser odbije GPS ili istekne 5s, odmah prebaci na IP lokaciju
+        await detectLocationByIp(targetRadius);
+      },
+      { enableHighAccuracy: false, timeout: 5000, maximumAge: 60000 }
+    );
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main className="min-h-screen bg-[#FAF8F5]">
+      <Preloader />
+      <Navbar />
+      <PlatformHero
+        selectedCategory={selectedCategory}
+        setSelectedCategory={setSelectedCategory}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
+        cityInput={cityInput}
+        setCityInput={setCityInput}
+        radiusKm={radiusKm}
+        setRadiusKm={setRadiusKm}
+        searchMode={searchMode}
+        onSearchByCity={handleSearchByCity}
+        onSearchNearby={handleSearchNearby}
+        isLoadingSalons={isLoadingSalons}
+        onQuickRebook={() => setQuickRebookTrigger((prev) => prev + 1)}
+      />
+      <SalonMarketplace
+        salons={salons}
+        searchMode={searchMode}
+        activeLocationLabel={activeLocationLabel}
+        activeRadiusKm={activeRadiusKm}
+        isLoadingSalons={isLoadingSalons}
+        selectedCategory={selectedCategory}
+        searchQuery={searchQuery}
+        quickRebookTrigger={quickRebookTrigger}
+      />
+    </main>
   );
 }
